@@ -126,6 +126,7 @@ inline sfa_state*   __sfa_get_state();
 inline uint64_t     __sfa_request_size_to_nearest_boundary(uint64_t size);
 inline uint64_t     __sfa_request_size_to_minimum_pool_size(uint64_t size);
 inline uint64_t     __sfa_request_size_to_minimum_alloc_size(uint64_t size);
+inline void*        __sfa_accomodate_allocation(uint64_t block, sfa_pool_search *search_results);
 inline void         __sfa_find_pool_for_alloc_fast(uint64_t size, sfa_pool_search *search_results);
 inline sfa_pool_descriptor* __sfa_create_pool(uint64_t pool_size);
 
@@ -169,6 +170,10 @@ typedef struct sfa_allocation_descriptor
     sfa_allocation_descriptor *left_descriptor;
     sfa_allocation_descriptor *right_descriptor;
     sfa_pool_descriptor *parent_pool;
+
+    void* block_pointer;
+    uint64_t block_offset;
+
     uint64_t allocation_size;
 
 } sfa_allocation_descriptor;
@@ -269,7 +274,13 @@ __sfa_create_pool(uint64_t pool_size)
     free_list->left_descriptor          = NULL;
     free_list->right_descriptor         = NULL;
     free_list->parent_pool              = pool;
-    free_list->allocation_size          = pool->memory_region_size - sizeof(sfa_allocation_descriptor);
+    free_list->allocation_size          = pool->memory_region_size - offset_size;
+
+    // Set the free block pointer and offset.
+    uint64_t block_offset = __sfa_request_size_to_nearest_boundary(sizeof(sfa_allocation_descriptor));
+    void *free_region = (uint8_t*)memory_offset + block_offset;
+    free_list->block_pointer = free_region;
+    free_list->block_offset = block_offset;
 
     pool->free_list = free_list;
     return pool;
@@ -314,6 +325,42 @@ __sfa_find_pool_for_alloc_fast(uint64_t size, sfa_pool_search *search_results)
     return;
 
 }
+
+inline void*        
+__sfa_accomodate_allocation(uint64_t block, sfa_pool_search *search_results)
+{
+
+    // NOTE(Chris): This function assumes that the search results are valid and
+    //              that the list node it contains will be able to fit the allocation.
+
+    SFA_ASSERT_POINTER(search_results);
+    SFA_ASSERT((*search_results->list_node)->allocation_size >= block);
+
+    // Pull stuff out to make things easier to see.
+    sfa_pool_descriptor *pool = search_results->pool;
+    sfa_allocation_descriptor **node = search_results->list_node;
+
+    void *memory_block_begin = (*node)->block_pointer;
+    void *new_free_region = (uint8_t*)memory_block_begin + block;
+
+    // Update the new block.
+    sfa_allocation_descriptor *new_descriptor = (sfa_allocation_descriptor*)new_free_region;
+    new_descriptor->flags.is_occupied = false;
+    new_descriptor->flags.is_coallescable = true;
+    new_descriptor->left_descriptor = *node;
+    new_descriptor->right_descriptor = (*node)->right_descriptor;
+    new_descriptor->allocation_size = (*node)->allocation_size - (*node)->block_offset - block;
+
+    // Left descriptor of the previous remains the same.
+    *node->right_descriptor = new_descriptor;
+
+    // Update the pool's state.
+    pool->memory_region_occupancy += block + (*node)->block_offset;
+
+    return new_free_region; // This is the user pointer.
+
+}
+
 
 // --- Win32 Definitions -------------------------------------------------------
 //
@@ -395,18 +442,24 @@ sf_alloc(uint64_t size)
     uint64_t required_size = __sfa_request_size_to_minimum_alloc_size(size);
     uint64_t nearest_boundary = __sfa_request_size_to_nearest_boundary(required_size);
 
-    // Select the pool.
+    // Select the pool and then accomodate.
     sfa_pool_search search_results = {0};
-    __sfa_find_pool_for_alloc_fast(required_size, &search_results);
-    
+    __sfa_find_pool_for_alloc_fast(nearest_boundary, &search_results);
+    SFA_ASSERT_POINTER(search_results.pool);
+    SFA_ASSERT_POINTER(search_results.list_node);
 
-    return NULL;
+    void* user_ptr = __sfa_accomodate_allocation(nearest_boundary, &search_results);
+    SFA_ASSERT_POINTER(user_ptr);
+
+    return user_ptr;
 
 }
 
 void    
 sf_free(void *ptr)
 {
+
+
 
 }
 
