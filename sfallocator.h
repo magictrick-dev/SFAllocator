@@ -117,6 +117,7 @@ void    sf_free(void *ptr);
 typedef struct sfa_allocation_descriptor    sfa_allocation_descriptor;
 typedef struct sfa_pool_descriptor          sfa_pool_descriptor;
 typedef struct sfa_state                    sfa_state;
+typedef struct sfa_pool_search              sfa_pool_search;
 
 inline void*        __sfa_virtual_alloc(void* offset, uint64_t size);
 inline void         __sfa_virtual_free(void* ptr);
@@ -125,6 +126,7 @@ inline sfa_state*   __sfa_get_state();
 inline uint64_t     __sfa_request_size_to_nearest_boundary(uint64_t size);
 inline uint64_t     __sfa_request_size_to_minimum_pool_size(uint64_t size);
 inline uint64_t     __sfa_request_size_to_minimum_alloc_size(uint64_t size);
+inline void         __sfa_find_pool_for_alloc_fast(uint64_t size, sfa_pool_search *search_results);
 inline sfa_pool_descriptor* __sfa_create_pool(uint64_t pool_size);
 
 typedef struct sfa_state
@@ -135,6 +137,12 @@ typedef struct sfa_state
     sfa_pool_descriptor *tail_pool;
 
 } sfa_state;
+
+typedef struct sfa_pool_search
+{
+    sfa_pool_descriptor *pool;
+    sfa_allocation_descriptor **list_node;
+} sfa_pool_search;
 
 // Describes a block of memory within a pool.
 typedef union sfa_allocation_flags
@@ -171,9 +179,7 @@ typedef struct sfa_pool_descriptor
 
     sfa_pool_descriptor        *next_pool;
     sfa_pool_descriptor        *prev_pool;
-
-    sfa_allocation_descriptor  *free_head;
-    sfa_allocation_descriptor  *free_tail;
+    sfa_allocation_descriptor  *free_list;
 
     void       *memory_region;
     uint64_t    memory_region_size;
@@ -189,9 +195,9 @@ __sfa_get_state()
     static sfa_state state = {0};
     if (state.initialized == false)
     {
-        state.head_pool = false;
-        state.tail_pool = false;
-        state.initialized = true;
+        state.head_pool     = NULL;
+        state.tail_pool     = NULL;
+        state.initialized   = true;
     }
 
     return &state;
@@ -238,7 +244,7 @@ __sfa_create_pool(uint64_t pool_size)
     // is poorly formatted *OR* somehow we hit the virtual allocation limit.
     uint64_t actual_reserve_size = __sfa_request_size_to_minimum_pool_size(pool_size);
     void *alloc_buffer = __sfa_virtual_alloc(NULL, actual_reserve_size);
-    SFA_ASSERT(alloc_buffer != NULL);
+    SFA_ASSERT_POINTER(alloc_buffer);
 
     // Create the pool, set the pool next and prev to NULL. The invokee of this
     // function is responsible for placing it in the list.
@@ -249,7 +255,7 @@ __sfa_create_pool(uint64_t pool_size)
     // Defines the memory region that the pool descriptor refers to.
     uint64_t offset_size = __sfa_request_size_to_nearest_boundary(sizeof(sfa_pool_descriptor));
     uint8_t *memory_offset = (uint8_t*)alloc_buffer + offset_size;
-    SFA_ASSERT(memory_offset % SFA_ALLOCATION_ALIGNMENT_SIZE);
+    SFA_ASSERT((uint64_t)memory_offset % SFA_ALLOCATION_ALIGNMENT_SIZE);
 
     pool->memory_region             = memory_offset;
     pool->memory_region_size        = actual_reserve_size - offset_size;
@@ -257,13 +263,55 @@ __sfa_create_pool(uint64_t pool_size)
     pool->pool_is_large             = false;
 
     // Finally, set the pool's initial free list.
-    sfa_allocation_descriptor *free_tail = (sfa_allocation_descriptor*)memory_offset;
-    free_tail->flags.is_occupied        = false;
-    free_tail->flags.is_coallescable    = true;
-    free_tail->left_descriptor          = NULL;
-    free_tail->right_descriptor         = NULL;
-    free_tail->parent_pool              = pool;
-    free_tail->allocation_size          = pool->memory_region_size - sizeof(sfa_allocation_descriptor);
+    sfa_allocation_descriptor *free_list = (sfa_allocation_descriptor*)memory_offset;
+    free_list->flags.is_occupied        = false;
+    free_list->flags.is_coallescable    = true;
+    free_list->left_descriptor          = NULL;
+    free_list->right_descriptor         = NULL;
+    free_list->parent_pool              = pool;
+    free_list->allocation_size          = pool->memory_region_size - sizeof(sfa_allocation_descriptor);
+
+    pool->free_list = free_list;
+    return pool;
+
+}
+
+inline void
+__sfa_find_pool_for_alloc_fast(uint64_t size, sfa_pool_search *search_results)
+{
+
+    sfa_state *state = __sfa_get_state();
+    SFA_ASSERT_POINTER(search_results);
+
+    // Find a pool which its free-list head can fit the allocation.
+    sfa_pool_descriptor *current_pool = state->head_pool;
+    sfa_allocation_descriptor *free_spot = NULL;
+    while (current_pool != NULL)
+    {
+
+        if (current_pool->free_list->allocation_size >= size)
+        {
+
+            search_results->pool = current_pool;
+            search_results->list_node = &current_pool->free_list;
+            return;
+
+        }
+
+    }
+
+    // We didn't find a pool to accomodate the allocation, create a new pool instead.
+    sfa_pool_descriptor *new_pool = __sfa_create_pool(size + sizeof(sfa_pool_descriptor));
+    SFA_ASSERT_POINTER(new_pool);
+
+    new_pool->prev_pool = state->tail_pool;
+    new_pool->next_pool = NULL;
+    state->tail_pool = new_pool;
+
+    SFA_ASSERT(new_pool->free_list->allocation_size >= size);
+    search_results->pool = new_pool;
+    search_results->list_node = &new_pool->free_list;
+    return;
 
 }
 
@@ -274,7 +322,7 @@ __sfa_create_pool(uint64_t pool_size)
 // little overhead (aside from the OS call itself).
 //
 
-#if defined (__WIN32)
+#if defined (_WIN32)
 #include <windows.h>
 
 void* 
@@ -322,12 +370,16 @@ __sfa_virtual_size()
 // Implementations of the external API functions.
 //
 
-void*   
+void
 sf_init(uint64_t reserve_size)
 {
 
     sfa_state *state = __sfa_get_state();
     sfa_pool_descriptor *pool = __sfa_create_pool(reserve_size);
+    SFA_ASSERT_POINTER(pool);
+
+    state->head_pool = pool;
+    state->tail_pool = pool;
     
 }
 
@@ -335,8 +387,20 @@ void*
 sf_alloc(uint64_t size)
 {
 
+    // Ensure that we have a valid pool initialized.
     sfa_state *state = __sfa_get_state();
     if (state->head_pool == NULL) sf_init(SFA_DEFAULT_INITIAL_POOL_SIZE);
+
+    // Size to the minimum size if required.
+    uint64_t required_size = __sfa_request_size_to_minimum_alloc_size(size);
+    uint64_t nearest_boundary = __sfa_request_size_to_nearest_boundary(required_size);
+
+    // Select the pool.
+    sfa_pool_search search_results = {0};
+    __sfa_find_pool_for_alloc_fast(required_size, &search_results);
+    
+
+    return NULL;
 
 }
 
